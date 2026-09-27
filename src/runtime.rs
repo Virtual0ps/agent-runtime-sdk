@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
-use crate::adapter::{AdapterState, AgentAdapter, CommandSpec, InteractionRequest};
+use crate::adapter::{AdapterState, AgentAdapter, CommandSpec, IdleFrame, InteractionRequest};
 use crate::error::classify_provider_failure;
 use crate::startup::{StartupObserver, StartupObserverState, StartupStage, StartupTrace};
 use crate::{
@@ -259,6 +259,29 @@ async fn read_bounded_retained_line(
 }
 
 impl RetainedCodexProcess {
+    /// Claim the process for a new turn.
+    ///
+    /// Idle retirement decides under the same I/O lock, so a process is never
+    /// both claimed by a turn and retired by its idle supervisor. `None` means
+    /// the process was already retired and must be replaced.
+    async fn claim(&self) -> Option<u64> {
+        let io = self.io.lock().await;
+        (io.is_some() && self.usable.load(Ordering::Acquire))
+            .then(|| self.generation.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// Mark the process unusable unless a turn claimed it after `generation`.
+    ///
+    /// Returns whether the caller now owns terminating it.
+    async fn retire_if_unclaimed(&self, generation: u64) -> bool {
+        let io = self.io.lock().await;
+        if io.is_none() || self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.usable.store(false, Ordering::Release);
+        true
+    }
+
     async fn terminate(&self) -> Result<()> {
         self.usable.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
@@ -305,6 +328,130 @@ impl Drop for RetainedTurnCleanup {
             supervisor.remove_if_same(&runtime_id, &process).await;
             let _ = process.terminate().await;
         });
+    }
+}
+
+/// How long an idle retained process holds its I/O lock waiting for a frame
+/// to begin, so a claiming turn is never blocked for longer.
+const IDLE_FRAME_WAIT: Duration = Duration::from_millis(25);
+/// Upper bound for reading the rest of a frame once it has begun.
+const IDLE_FRAME_COMPLETION: Duration = Duration::from_secs(5);
+/// Upper bound for an answer to [`AgentAdapter::retained_keepalive_probe`].
+const KEEPALIVE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read one frame from an idle retained process without splitting it.
+///
+/// Returns `None` when no frame began within [`IDLE_FRAME_WAIT`]. Waiting on
+/// `fill_buf` consumes nothing, so giving up leaves the stream at a frame
+/// boundary for the next turn; a frame that has begun is read to completion.
+async fn read_idle_retained_line(
+    reader: &mut BufReader<crate::TransportReader>,
+    limit: usize,
+) -> Option<std::io::Result<Option<String>>> {
+    match tokio::time::timeout(
+        IDLE_FRAME_WAIT,
+        tokio::io::AsyncBufReadExt::fill_buf(reader),
+    )
+    .await
+    {
+        Err(_) => None,
+        Ok(Err(error)) => Some(Err(error)),
+        Ok(Ok(_)) => Some(
+            tokio::time::timeout(
+                IDLE_FRAME_COMPLETION,
+                read_bounded_retained_line(reader, limit),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "provider frame did not complete",
+                ))
+            }),
+        ),
+    }
+}
+
+/// Own a retained Claude or Codex process between turns.
+///
+/// Background work the process owns (a Codex background terminal running a
+/// dev server) keeps emitting frames and dies with the process. Such frames
+/// are dropped, and when the idle timeout elapses the adapter is asked
+/// whether that work is still live before the process is terminated. Frames
+/// that cannot be assigned to a turn retire the process. A turn that claims
+/// the process bumps its generation, which ends this task.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_idle_retained_process(
+    adapter: Arc<dyn AgentAdapter>,
+    supervisor: CodexProcessSupervisor,
+    runtime_id: crate::lifecycle::RuntimeId,
+    retained: Arc<RetainedCodexProcess>,
+    generation: u64,
+    provider: Provider,
+    idle_timeout: Duration,
+    max_event_line_bytes: usize,
+) {
+    let current = |retained: &RetainedCodexProcess| {
+        retained.generation.load(Ordering::Acquire) == generation
+            && retained.usable.load(Ordering::Acquire)
+    };
+    let mut expires_at = tokio::time::Instant::now() + idle_timeout;
+    let mut probe_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        if !current(&retained) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        // Checked on every iteration: a terminal that keeps logging must not
+        // hold the process open while its probe goes unanswered.
+        if probe_deadline.is_some_and(|deadline| now >= deadline) {
+            break;
+        }
+        let probe = if probe_deadline.is_none() && now >= expires_at {
+            let session_id = retained.session_id.lock().await.clone();
+            match session_id
+                .as_deref()
+                .and_then(|session_id| adapter.retained_keepalive_probe(session_id))
+            {
+                Some(probe) => Some(probe),
+                None => break,
+            }
+        } else {
+            None
+        };
+        let observed = {
+            let mut io = retained.io.lock().await;
+            if !current(&retained) {
+                return;
+            }
+            let Some(io) = io.as_mut() else { return };
+            if let Some(probe) = probe {
+                if write_provider_frames(provider, Some(&mut io.stdin), &[probe], "keepalive")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                probe_deadline = Some(now + KEEPALIVE_RESPONSE_TIMEOUT);
+            }
+            read_idle_retained_line(&mut io.reader, max_event_line_bytes).await
+        };
+        match observed {
+            None => {}
+            Some(Ok(Some(line))) => match adapter.classify_idle_frame(&line) {
+                IdleFrame::Background => {}
+                IdleFrame::KeepaliveResult { active: true } => {
+                    probe_deadline = None;
+                    expires_at = tokio::time::Instant::now() + idle_timeout;
+                }
+                IdleFrame::KeepaliveResult { active: false } | IdleFrame::Unexpected => break,
+            },
+            Some(Ok(None) | Err(_)) => break,
+        }
+    }
+    if retained.retire_if_unclaimed(generation).await {
+        supervisor.remove_if_same(&runtime_id, &retained).await;
+        let _ = retained.terminate().await;
     }
 }
 
@@ -2807,9 +2954,10 @@ impl AgentRuntime {
                             .to_string(),
                     })
                     .await?;
-                let claim = candidate.generation.fetch_add(1, Ordering::AcqRel) + 1;
-                claimed_generation = Some(claim);
-                let request_id = format!("temps-agent-runtime-health-{claim}");
+                let claim = candidate.claim().await;
+                claimed_generation = claim;
+                let request_id =
+                    format!("temps-agent-runtime-health-{}", claim.unwrap_or_default());
                 let probe = serde_json::to_vec(&serde_json::json!({
                     "type": "control_request",
                     "request_id": request_id,
@@ -2824,7 +2972,7 @@ impl AgentRuntime {
                     .config
                     .initialization_timeout
                     .min(Duration::from_secs(3));
-                let healthy = {
+                let healthy = claim.is_some() && {
                     let mut guard = candidate.io.lock().await;
                     if let Some(io) = guard.as_mut() {
                         let exchange = async {
@@ -2902,13 +3050,20 @@ impl AgentRuntime {
                             .to_string(),
                     })
                     .await?;
-                claimed_generation = Some(candidate.generation.fetch_add(1, Ordering::AcqRel) + 1);
+                claimed_generation = candidate.claim().await;
                 let health_timeout = supervisor
                     .inner
                     .config
                     .initialization_timeout
                     .min(Duration::from_secs(3));
                 let health = tokio::time::timeout(health_timeout, async {
+                    if claimed_generation.is_none() {
+                        return Err(RuntimeError::Protocol {
+                            provider,
+                            message: "the retained OpenCode server was retired while idle"
+                                .to_string(),
+                        });
+                    }
                     let streams = adapter.attach(request, &state).await?.ok_or_else(|| {
                         RuntimeError::Protocol {
                             provider,
@@ -2980,6 +3135,17 @@ impl AgentRuntime {
                             message: "The retained OpenCode server stopped responding before prompt submission; starting a replacement.".to_string(),
                         }).await?;
                 }
+            }
+        } else if let Some(candidate) = existing.clone() {
+            claimed_generation = candidate.claim().await;
+            if claimed_generation.is_none() {
+                // Its idle supervisor retired it after the lookup above.
+                supervisor.remove_if_same(runtime_id, &candidate).await;
+                if available_permit.is_none() {
+                    available_permit = candidate.permit.lock().await.take();
+                }
+                candidate.terminate().await?;
+                existing = None;
             }
         }
         let retained = if let Some(existing) = existing {
@@ -3199,61 +3365,29 @@ impl AgentRuntime {
                 *retained.session_id.lock().await = result.session_id.clone();
                 cleanup.disarm();
                 let runtime_id = runtime_id.clone();
-                let retained_for_expiry = Arc::clone(&retained);
-                let supervisor_for_expiry = supervisor.clone();
+                let retained = Arc::clone(&retained);
+                let supervisor = supervisor.clone();
                 let idle_timeout = supervisor.inner.config.idle_timeout;
-                let retained_for_drain = Arc::clone(&retained);
-                let supervisor_for_drain = supervisor.clone();
-                let runtime_id_for_drain = runtime_id.clone();
-                let max_event_line_bytes = self.max_event_line_bytes;
-                if provider != Provider::OpenCode {
+                if provider == Provider::OpenCode {
                     tokio::spawn(async move {
-                        loop {
-                            if retained_for_drain.generation.load(Ordering::Acquire) != generation
-                                || !retained_for_drain.usable.load(Ordering::Acquire)
-                            {
-                                return;
-                            }
-                            let observed = {
-                                let mut io = retained_for_drain.io.lock().await;
-                                if retained_for_drain.generation.load(Ordering::Acquire)
-                                    != generation
-                                {
-                                    return;
-                                }
-                                let Some(io) = io.as_mut() else { return };
-                                tokio::time::timeout(
-                                    Duration::from_millis(25),
-                                    read_bounded_retained_line(
-                                        &mut io.reader,
-                                        max_event_line_bytes,
-                                    ),
-                                )
-                                .await
-                            };
-                            if observed.is_ok() {
-                                // Any frame after the terminal event makes the
-                                // connection ambiguous. Retire it instead of
-                                // assigning or replying under a later turn.
-                                retained_for_drain.usable.store(false, Ordering::Release);
-                                supervisor_for_drain
-                                    .remove_if_same(&runtime_id_for_drain, &retained_for_drain)
-                                    .await;
-                                let _ = retained_for_drain.terminate().await;
-                                return;
-                            }
+                        tokio::time::sleep(idle_timeout).await;
+                        if retained.retire_if_unclaimed(generation).await {
+                            supervisor.remove_if_same(&runtime_id, &retained).await;
+                            let _ = retained.terminate().await;
                         }
                     });
+                } else {
+                    tokio::spawn(supervise_idle_retained_process(
+                        adapter.clone(),
+                        supervisor,
+                        runtime_id,
+                        retained,
+                        generation,
+                        provider,
+                        idle_timeout,
+                        self.max_event_line_bytes,
+                    ));
                 }
-                tokio::spawn(async move {
-                    tokio::time::sleep(idle_timeout).await;
-                    if retained_for_expiry.generation.load(Ordering::Acquire) == generation {
-                        supervisor_for_expiry
-                            .remove_if_same(&runtime_id, &retained_for_expiry)
-                            .await;
-                        let _ = retained_for_expiry.terminate().await;
-                    }
-                });
                 Ok(result)
             }
             Err(error) => Err(error),
