@@ -7,6 +7,9 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- OpenCode's compaction summary is no longer streamed as assistant text. Its
+  cost still counts: OpenCode turn cost is now the sum of every assistant
+  message in the turn instead of the last message's cost.
 - Codex resumes and active-writer forks omit historical turns from their replies,
   so long conversations can continue without exceeding the protocol frame limit.
   Saved provider context is preserved.
@@ -34,6 +37,21 @@ Versioning and Keep a Changelog conventions.
   Relay destinations and credential references remain trusted host settings.
 
 ### Added
+
+- Report the context-compaction lifecycle inside ordinary turns for Claude
+  (`status: compacting` → `compact_boundary`), Codex app-server
+  (`contextCompaction` items, with `thread/compacted` as a fallback), and
+  OpenCode serve (`compaction` part → `session.compacted`). Adapters emit
+  `TurnEvent::CompactionStarted` when the harness begins compacting and the
+  new `TurnEvent::CompactionFailed` when an open compaction ends without
+  compacting, so applications can show an in-progress state for automatic
+  compaction. New `TurnCapabilities::compaction_lifecycle` and
+  `RuntimeDriverCapabilities::compaction_lifecycle` flags advertise support.
+  Retained invocations deliver one start per compaction even when the provider
+  repeats its signal.
+  A turn or retained invocation that ends with a compaction still open (the
+  provider exits, is cancelled, or never confirms a manual `/compact`) emits
+  `CompactionFailed`, so no compaction is left running.
 
 - Add opt-in, bounded Codex app-server process reuse for in-process retained
   runtimes, with strict runtime/configuration isolation, cold fallback at pool
