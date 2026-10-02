@@ -105,6 +105,16 @@ provider-native status, optional agent type, error, and summary.
 `AgentTaskActivity` distinguishes started, updated, progress, completed, failed,
 and stopped transitions and can include nesting depth, last tool, and task-local
 usage. A nested `ToolCall.task_id` uses the same native ID as the task snapshot.
+The result of a background shell task's `Bash` call carries that task's ID too.
+
+A task of kind `workflow` also carries `AgentTask::workflow`: the run's phases,
+agents and recent logs, replaced on every update. Its `TaskActivity` records
+agent state changes, with the changed agent in `workflow_agent`, rather than
+every progress tick. `Claude::transcript_activity` rebuilds a workflow agent's
+own activity, including recorded reasoning, from the transcript at
+`AgentWorkflow::agent_transcript_path`; its tool inputs and outputs are not
+redacted. See
+[Show Claude workflows](../how-to/stream-claude-subagents.md#show-claude-workflows).
 
 Claude can finish the parent response before background subagents finish. The
 adapter keeps reading the stream and servicing interactions until the native
